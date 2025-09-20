@@ -1,0 +1,65 @@
+name: gcc
+version: 13.2.0
+category: devel
+description: >
+  The GNU Compiler Collection (GCC) includes front ends for C, C++,
+  Objective-C, Fortran, Ada, Go, and D, as well as libraries for these
+  languages.
+homepage: https://gcc.gnu.org/
+license: GPL-3.0
+maintainer: pyport@localhost
+
+source:
+  - url: https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz
+    checksum: sha256: e0b1de5d94c0f3c6e6c037bbf…   # hash real daqui
+  - url: https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz
+    checksum: sha256: 0bba1df39f4f9f73a6a5a87c…
+    extract_dir: gmp
+  - url: https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.0.tar.xz
+    checksum: sha256: 1dcb4f3a…
+    extract_dir: mpfr
+  - url: https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz
+    checksum: sha256: 17503d2c…
+    extract_dir: mpc
+
+depends_build:
+  - binutils
+  - make
+  - flex
+  - bison
+  - gawk
+  - texinfo
+
+depends_run:
+  - glibc
+  - zlib
+
+build:
+  type: autotools
+  options:
+    prefix: /usr
+    enable-languages: c,c++,fortran
+    disable-multilib: true
+    disable-bootstrap: true
+    enable-shared: true
+    enable-threads: posix
+    with-system-zlib: true
+
+patches:
+  - patches/gcc-13.2-fix-glibc-compat.patch
+  - patches/gcc-13.2-disable-werror.patch
+
+hooks:
+  post_install:
+    - ln -sv gcc /usr/bin/cc
+    - ln -sv g++ /usr/bin/c++
+
+update:
+  method: regex
+  url: https://ftp.gnu.org/gnu/gcc/
+  pattern: 'gcc-(\d+\.\d+\.\d+)\.tar\.xz'
+
+notes: |
+  GCC 13.2.0 é a versão estável atual da série 13.
+  O pacote integra bibliotecas externas GMP, MPFR e MPC.
+  Use --enable-languages para adicionar suporte extra (ex: ada, go, d).
