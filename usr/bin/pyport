@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""
+PyPort - Gerenciador de ports estilo BSD em Python
+Binário wrapper que chama o CLI em /usr/lib/pyport/cli.py
+"""
+
+import sys
+import os
+
+PYPORT_LIBDIR = "/usr/lib/pyport"
+
+if PYPORT_LIBDIR not in sys.path:
+    sys.path.insert(0, PYPORT_LIBDIR)
+
+try:
+    from pyport.cli import main
+except ImportError as e:
+    sys.stderr.write("Erro: não foi possível importar pyport.cli\n")
+    sys.stderr.write(f"Detalhes: {e}\n")
+    sys.exit(1)
+
+if __name__ == "__main__":
+    main()
