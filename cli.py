@@ -1,138 +1,220 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-pyport.cli - Interface de linha de comando para PyPort
-Completa, funcional, colorida, com abreviações.
+cli.py — Interface de linha de comando do PyPort
+
+Chamadas suportadas:
+  build, remove, sync, info, list, install, search, update,
+  toolchain, chroot
+
+Com abreviaturas, cores, integração de todos os módulos
 """
 
-import argparse
+import os
 import sys
-from colorama import Fore, Style, init as colorama_init
+import argparse
+from pathlib import Path
+import json
 
-# Integração de módulos
-import build
-import remove
-import info
-import search
-import sync
-import update
-import dependency
-import packager
-import config as cfg
+from pyport.logger import get_logger
+from pyport.config import get_config
+from pyport.core import Core
+from pyport.dependency import DependencyGraph
+from pyport.update import check_updates
+from pyport.search import search_ports
+from pyport.info import info_ports
+from pyport.install import install_package
+from pyport.fakeroot import Fakerunner
+from pyport.toolchain import ToolchainManager
+from pyport.sandbox import ChrootManager
 
-colorama_init(autoreset=True)
+LOG = get_logger("pyport.cli")
 
-
-def c_info(msg): print(Fore.CYAN + "[INFO] " + Style.RESET_ALL + msg)
-def c_ok(msg): print(Fore.GREEN + "[OK] " + Style.RESET_ALL + msg)
-def c_warn(msg): print(Fore.YELLOW + "[WARN] " + Style.RESET_ALL + msg)
-def c_err(msg): print(Fore.RED + "[ERROR] " + Style.RESET_ALL + msg)
-
+def _print_colored(text: str, color_code: str, enabled=True):
+    if enabled:
+        print(f"\033[{color_code}m{text}\033[0m")
+    else:
+        print(text)
 
 def main():
-    parser = argparse.ArgumentParser(
-        prog="pyport",
-        description="PyPort - Gerenciador de Ports estilo BSD, em Python",
-    )
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    cfg = get_config()
+    core = Core()
+    toolchain = ToolchainManager(cfg)
+    chroot = ChrootManager(cfg)
+
+    parser = argparse.ArgumentParser(prog="pyport",
+                                     description="PyPort - Gerenciador de ports source para Linux",
+                                     formatter_class=argparse.RawTextHelpFormatter)
+
+    # Abreviações
+    cmd_aliases = {
+        "b": "build",
+        "rm": "remove",
+        "r": "remove",
+        "i": "install",
+        "s": "sync",
+        "ls": "list",
+        "u": "update",
+        "upd": "update",
+        "se": "search",
+        "tc": "toolchain",
+        "ch": "chroot"
+    }
+
+    sub = parser.add_subparsers(dest="cmd", required=True, help="comando a executar")
 
     # build
-    p_build = sub.add_parser("build", aliases=["b"], help="Construir um pacote")
-    p_build.add_argument("pkg", help="Nome do pacote a construir")
-
-    # install
-    p_install = sub.add_parser("install", aliases=["i"], help="Instalar pacote")
-    p_install.add_argument("file", help="Arquivo do pacote (.tar.zst, .deb, etc.)")
+    p_build = sub.add_parser("build", help="Construir um port")
+    p_build.add_argument("portname", help="Nome do port a construir")
+    p_build.add_argument("--force", "-f", action="store_true", help="Forçar rebuild")
+    p_build.add_argument("--dry-run", "-d", action="store_true", help="Simular sem executar")
 
     # remove
-    p_remove = sub.add_parser("remove", aliases=["rm"], help="Remover pacote")
-    p_remove.add_argument("pkg", help="Nome do pacote a remover")
-
-    # update
-    p_update = sub.add_parser("update", aliases=["u"], help="Checar atualizações")
-
-    # deps
-    p_deps = sub.add_parser("deps", aliases=["d"], help="Gerenciar dependências")
-    p_deps.add_argument("pkg", help="Nome do pacote")
-    p_deps.add_argument("--reverse", "-r", action="store_true", help="Mostrar dependências reversas")
-
-    # search
-    p_search = sub.add_parser("search", aliases=["s"], help="Buscar pacotes")
-    p_search.add_argument("term", help="Termo de busca")
-
-    # info
-    p_info = sub.add_parser("info", aliases=["in"], help="Mostrar informações")
-    p_info.add_argument("pkg", help="Nome do pacote")
+    p_remove = sub.add_parser("remove", help="Remover um port instalado")
+    p_remove.add_argument("portname", help="Nome do port a remover")
+    p_remove.add_argument("--force", "-f", action="store_true", help="Ignorar dependências reversas")
+    p_remove.add_argument("--dry-run", "-d", action="store_true", help="Simular sem executar")
+    p_remove.add_argument("--yes", "-y", action="store_true", help="Confirmar automaticamente")
 
     # sync
-    p_sync = sub.add_parser("sync", aliases=["sy"], help="Sincronizar repositório")
+    sub.add_parser("sync", help="Sincronizar árvore de ports")
 
-    # config
-    p_config = sub.add_parser("config", aliases=["c"], help="Gerenciar configuração")
-    p_config.add_argument("action", choices=["show", "validate"], help="Ação de configuração")
+    # info
+    p_info = sub.add_parser("info", help="Mostrar informação de um port")
+    p_info.add_argument("portname", help="Nome do port")
+
+    # list
+    sub.add_parser("list", help="Listar todos os ports disponíveis")
+
+    # install
+    p_install = sub.add_parser("install", help="Instalar pacote gerado")
+    p_install.add_argument("package_file", help="Arquivo de pacote ou nome")
+    p_install.add_argument("--force", "-f", action="store_true")
+    p_install.add_argument("--dry-run", "-d", action="store_true")
+
+    # search
+    p_search = sub.add_parser("search", help="Procurar ports")
+    p_search.add_argument("term", help="Termo de busca")
+    p_search.add_argument("--limit", "-l", type=int, default=20)
+
+    # update
+    sub.add_parser("update", help="Verificar atualizações disponíveis")
+
+    # toolchain
+    p_tc = sub.add_parser("toolchain", help="Gerenciar toolchain em /mnt/tools")
+    tc_sub = p_tc.add_subparsers(dest="tc_cmd", required=True)
+
+    p_tc_create = tc_sub.add_parser("create", help="Criar toolchain base")
+    p_tc_create.add_argument("--arch", default="x86_64", help="Arquitetura alvo")
+
+    tc_sub.add_parser("remove", help="Remover toolchain")
+    tc_sub.add_parser("list", help="Listar toolchains disponíveis")
+
+    # chroot
+    p_ch = sub.add_parser("chroot", help="Gerenciar ambiente chroot")
+    ch_sub = p_ch.add_subparsers(dest="ch_cmd", required=True)
+
+    ch_sub.add_parser("enter", help="Entrar no chroot")
+    ch_sub.add_parser("clean", help="Desmontar e limpar chroot")
+
+    # opções globais
+    parser.add_argument("--color", action="store_true", help="Forçar saída colorida")
+    parser.add_argument("--no-color", action="store_true", help="Desativar cores")
+    parser.add_argument("--verbose", "-v", action="count", default=0, help="Mais verbosidade")
 
     args = parser.parse_args()
 
-    # Dispatcher
-    if args.cmd in ("build", "b"):
-        c_info(f"Construindo {args.pkg}...")
-        build.build_package(args.pkg)
-        c_ok(f"Build finalizado: {args.pkg}")
+    # Resolver abreviações
+    cmd = cmd_aliases.get(args.cmd, args.cmd)
 
-    elif args.cmd in ("install", "i"):
-        c_info(f"Instalando {args.file}...")
-        packager.install_package(args.file)
-        c_ok("Instalação concluída.")
+    # Verbosidade
+    if args.verbose >= 2:
+        LOG.setLevel("DEBUG")
+    elif args.verbose == 1:
+        LOG.setLevel("INFO")
 
-    elif args.cmd in ("remove", "rm"):
-        c_warn(f"Removendo {args.pkg}...")
-        remove.remove_package(args.pkg)
-        c_ok("Remoção concluída.")
+    use_color = not args.no_color
 
-    elif args.cmd in ("update", "u"):
-        c_info("Checando atualizações...")
-        update.check_updates()
+    try:
+        if cmd == "build":
+            res = core.build(args.portname, force=args.force, dry_run=args.dry_run)
+            sys.exit(0 if res else 1)
 
-    elif args.cmd in ("deps", "d"):
-        dg = dependency.DependencyGraph()
-        if args.reverse:
-            rev = dg.get_reverse_dependencies(args.pkg)
-            c_info(f"Dependências reversas de {args.pkg}: {rev}")
+        elif cmd == "remove":
+            res = core.remove(args.portname, force=args.force, dry_run=args.dry_run, yes=args.yes)
+            sys.exit(0 if res else 1)
+
+        elif cmd == "sync":
+            sys.exit(0 if core.sync() else 1)
+
+        elif cmd == "info":
+            core.info(args.portname)
+            sys.exit(0)
+
+        elif cmd == "list":
+            core.list_ports()
+            sys.exit(0)
+
+        elif cmd == "install":
+            pkg = Path(args.package_file)
+            if not pkg.exists():
+                pkgdir = Path(cfg["paths"]["packages"])
+                candidate = pkgdir / args.package_file
+                if candidate.exists():
+                    pkg = candidate
+                else:
+                    LOG.error(f"Pacote {args.package_file} não encontrado")
+                    sys.exit(1)
+            fr = Fakerunner(dry_run=args.dry_run, debug=(args.verbose>=2))
+            res = install_package(pkg, sandbox=fr, force=args.force, dry_run=args.dry_run)
+            sys.exit(0 if res else 1)
+
+        elif cmd == "search":
+            matches = search_ports(args.term, limit=args.limit)
+            for m in matches:
+                _print_colored(m, "33", enabled=use_color)
+            sys.exit(0)
+
+        elif cmd == "update":
+            upd = check_updates()
+            if not upd:
+                LOG.info("Nenhuma atualização encontrada.")
+                sys.exit(0)
+            for portname, current, latest in upd:
+                _print_colored(f"{portname}: {current} → {latest}", "32", enabled=use_color)
+            repfile = cfg.get("update", {}).get("report_file")
+            if repfile:
+                with open(repfile, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(upd, indent=2, ensure_ascii=False))
+                LOG.info(f"Relatório salvo em {repfile}")
+            sys.exit(0)
+
+        elif cmd == "toolchain":
+            if args.tc_cmd == "create":
+                res = toolchain.create(args.arch)
+                sys.exit(0 if res else 1)
+            elif args.tc_cmd == "remove":
+                sys.exit(0 if toolchain.remove() else 1)
+            elif args.tc_cmd == "list":
+                toolchain.list()
+                sys.exit(0)
+
+        elif cmd == "chroot":
+            if args.ch_cmd == "enter":
+                sys.exit(0 if chroot.enter() else 1)
+            elif args.ch_cmd == "clean":
+                sys.exit(0 if chroot.clean() else 1)
+
         else:
-            deps = dg.get_dependencies(args.pkg)
-            c_info(f"Dependências de {args.pkg}: {deps}")
+            parser.print_help()
+            sys.exit(1)
 
-    elif args.cmd in ("search", "s"):
-        res = search.search_ports(args.term)
-        if res:
-            for r in res:
-                print(f"- {Fore.GREEN}{r['name']}{Style.RESET_ALL} {r['version']} - {r.get('description','')}")
-        else:
-            c_warn("Nenhum resultado encontrado.")
-
-    elif args.cmd in ("info", "in"):
-        info.show_info(args.pkg)
-
-    elif args.cmd in ("sync", "sy"):
-        c_info("Sincronizando repositórios...")
-        sync.sync_ports()
-
-    elif args.cmd in ("config", "c"):
-        conf = cfg.Config.load()
-        if args.action == "show":
-            for k, v in conf.to_dict().items():
-                print(f"{Fore.CYAN}{k}{Style.RESET_ALL}: {v}")
-        elif args.action == "validate":
-            ok, probs = conf.validate()
-            if ok:
-                c_ok("Configuração válida.")
-            else:
-                c_err("Configuração inválida:")
-                for p in probs:
-                    print(" -", p)
-
-    else:
-        parser.print_help()
+    except Exception as e:
+        LOG.error(f"Erro no comando {cmd}: {e}")
+        if args.verbose >= 2:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
