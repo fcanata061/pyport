@@ -1,0 +1,52 @@
+# ========================
+# PyPort - Configuração
+# ========================
+
+# Diretórios principais
+paths:
+  ports_dir: /usr/ports          # Onde ficam os Portfiles.yaml
+  modules_dir: /pyport/modules   # Módulos internos do pyport
+  build_root: /var/tmp/pyport    # Pasta usada pelo sandbox para builds
+  pkg_dir: /var/cache/pyport/pkg # Onde ficam os pacotes empacotados
+  log_dir: /var/log/pyport       # Logs de build, remove, update etc.
+  patches_dir: patches           # Subpasta dentro de cada port
+
+# Sandbox e permissões
+sandbox:
+  use_chroot: true               # Ativa chroot durante build
+  mount_proc: true
+  mount_sys: true
+  mount_dev: true
+  copy_resolv: true              # Copia /etc/resolv.conf para dentro do chroot
+  fakeroot: true                 # Ativa fakeroot para builds sem root real
+  keep_build: false              # Mantém build/ após instalação (debug)
+
+# Repositório remoto dos Portfiles
+repo:
+  type: git
+  url: https://github.com/fcanata061/pyport-ports.git
+  branch: main
+
+# Notificações
+notify:
+  enabled: true
+  method: notify-send            # Pode ser: notify-send, stdout, log-only
+
+# CLI
+cli:
+  color: true
+  abbreviations: true            # Ativa abreviações (ex: i=install, rm=remove)
+  pager: less
+
+# Update checker
+update:
+  enabled: true
+  interval_days: 7               # Quantos dias entre rodadas automáticas
+  report_file: /var/log/pyport/update-report.txt
+  notify_only: true              # Apenas notifica (não atualiza nada)
+
+# Dependências
+dependencies:
+  solver: toposort               # Algoritmo padrão para resolver deps
+  allow_reverse: true            # Permite consulta de dependências reversas
+  strict: true                   # Se true, falha se faltar dependência
