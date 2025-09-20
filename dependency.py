@@ -1,583 +1,656 @@
-# dependency.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Dependency graph manager for PyPort
-----------------------------------
+dependency.py - Advanced dependency manager for PyPort
 
-Features:
- - Represent packages and dependency edges as a directed graph.
- - Support for version constraints using `packaging` (if available) or a
-   simple fallback parser.
- - Topological sort (install order) with cycle detection (Kahn algorithm).
- - Reverse dependency queries (packages that depend on X).
- - Uninstall order (reverse topological) to remove safely.
- - Conflict detection (incompatible version constraints).
- - Export/import graph as JSON.
- - Export graph as Graphviz DOT.
- - Simple CLI for common actions: build graph from portfiles, show orders,
-   find cycles, visualize.
- - Integration hooks for reading an "installed DB" (optional).
+Improvements included:
+ - Robust version handling using packaging.version when available
+ - Constraint parsing (==, !=, >=, <=, >, <) and simple satisfiability checks
+ - Nodes support metadata: version(s), provides, conflicts, replaces, source, port_path
+ - Topological sorting with cycle detection and explicit cycle paths
+ - Reverse dependency queries (immediate and recursive)
+ - Resolve function that attempts to produce an install order honoring constraints
+ - Load ports tree (Portfile.yaml) scanning for common dependency keys
+ - Atomic persistence with simple file locking to /pyport/db/deps.json
+ - Export to DOT and JSON
+ - CLI with multiple useful commands
 """
 
 from __future__ import annotations
 import os
-import sys
 import json
+import time
+import tempfile
+import shutil
+import fcntl
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Set, Iterable, Any
-from collections import defaultdict, deque, namedtuple
+from typing import Dict, List, Tuple, Optional, Set, Any, Iterable
+from collections import defaultdict, deque
 
-# Try to use packaging for robust version & specifier handling
+# Logging: prefer pyport.logger if available
 try:
-    from packaging.version import Version, InvalidVersion
-    from packaging.specifiers import SpecifierSet, InvalidSpecifier
-    _HAS_PACKAGING = True
+    from pyport.logger import get_logger
+    LOG = get_logger("pyport.dependency")
 except Exception:
-    _HAS_PACKAGING = False
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    LOG = logging.getLogger("pyport.dependency")
 
-# Data structures
-Dependency = namedtuple("Dependency", ["name", "constraint", "optional"])  # constraint: string like ">=1.2,<2.0"
-NodeInfo = Dict[str, Any]  # arbitrary metadata e.g. version, category, source_url
+# Config: try to get ports path, db path
+try:
+    from pyport.config import get_config
+    _CFG = get_config()
+    PORTS_ROOT_DEFAULT = _CFG.get("paths", {}).get("ports", "/usr/ports")
+    DB_DIR = Path(_CFG.get("paths", {}).get("db", "/pyport/db"))
+except Exception:
+    PORTS_ROOT_DEFAULT = "/usr/ports"
+    DB_DIR = Path("/pyport/db")
 
+DB_DIR.mkdir(parents=True, exist_ok=True)
+PERSIST_FILE = DB_DIR / "deps.json"
+LOCK_FILE = DB_DIR / "deps.lock"
 
-# Exceptions
-class DependencyError(Exception):
-    pass
+# YAML parser if available
+try:
+    import yaml
+except Exception:
+    yaml = None
 
-class CycleError(DependencyError):
-    def __init__(self, cycle: List[str]):
-        super().__init__(f"Dependency cycle detected: {' -> '.join(cycle)}")
-        self.cycle = cycle
-
-class UnsatisfiableError(DependencyError):
-    def __init__(self, package: str, constraint: str):
-        super().__init__(f"Unsatisfiable constraint for {package}: {constraint}")
-        self.package = package
-        self.constraint = constraint
-
-class VersionParseError(DependencyError):
-    pass
-
-
-# --- Version helpers ---------------------------------------------------------
-
-def parse_version(v: str):
-    """Parse a version string; use packaging.Version if available, else return raw string."""
-    if v is None:
-        return None
-    if _HAS_PACKAGING:
+# Prefer packaging.version for robust version comparison
+try:
+    from packaging.version import Version as PV, InvalidVersion
+    def _parse_ver(s):
         try:
-            return Version(str(v))
-        except InvalidVersion as e:
-            raise VersionParseError(f"Invalid version '{v}': {e}")
-    else:
-        # fallback: return raw string (comparisons will be simplistic)
-        return str(v)
-
-def parse_constraint(spec: Optional[str]):
-    """
-    Return a SpecifierSet if packaging available; else return the raw string.
-    Spec examples: '>=1.2,<2.0', '==1.4'
-    """
-    if not spec:
-        return None
-    if _HAS_PACKAGING:
-        try:
-            return SpecifierSet(spec)
-        except InvalidSpecifier as e:
-            raise VersionParseError(f"Invalid version specifier '{spec}': {e}")
-    else:
-        # fallback: we only support equality "==x" or simple ">=x" lexicographic comparisons
-        return str(spec)
-
-
-def satisfies_version(ver: Optional[str], constraint) -> bool:
-    """Check if version satisfies constraint. If packaging not available do best-effort."""
-    if constraint is None:
-        return True
-    if _HAS_PACKAGING:
-        if ver is None:
-            # no version known -> cannot guarantee, assume ok (could be conservative)
-            return True
-        try:
-            v = Version(str(ver))
+            return PV(str(s))
         except InvalidVersion:
-            return True
-        return v in constraint  # SpecifierSet membership
-    else:
-        # naive fallback: support "==", and prefix ">=" ",<"
-        if ver is None:
-            return True
-        v = str(ver)
-        s = str(constraint)
-        # split on comma
-        parts = [p.strip() for p in s.split(",")]
-        for p in parts:
-            if p.startswith("=="):
-                if v != p[2:]:
-                    return False
-            elif p.startswith(">="):
-                if v < p[2:]:
-                    return False
-            elif p.startswith("<="):
-                if v > p[2:]:
-                    return False
-            elif p.startswith(">"):
-                if v <= p[1:]:
-                    return False
-            elif p.startswith("<"):
-                if v >= p[1:]:
-                    return False
-            else:
-                # unknown constraint form -> ignore
-                continue
+            return None
+except Exception:
+    PV = None
+    def _parse_ver(s):
+        # fallback: convert numeric-dot separated strings to tuple
+        if s is None:
+            return None
+        try:
+            parts = []
+            for p in str(s).split("."):
+                if p.isdigit():
+                    parts.append(int(p))
+                else:
+                    parts.append(p)
+            return tuple(parts)
+        except Exception:
+            return str(s)
+
+# ----------------- Utility: constraint parsing & checking -----------------
+
+def parse_requirement(req: Optional[str]) -> Optional[Tuple[str, str]]:
+    """
+    Parse simple requirement strings:
+      ">=1.2.3" -> (">=", "1.2.3")
+      "1.2.3"   -> ("==", "1.2.3")
+      None -> None
+    """
+    if req is None:
+        return None
+    s = str(req).strip()
+    for op in (">=", "<=", "==", "!=", ">", "<"):
+        if s.startswith(op):
+            return (op, s[len(op):].strip())
+    # no operator => equality
+    return ("==", s)
+
+def satisfies(candidate_version: Optional[str], requirement: Optional[str]) -> bool:
+    """
+    Check whether candidate_version satisfies requirement.
+    candidate_version and requirement are strings or None.
+    """
+    if requirement is None:
         return True
+    if candidate_version is None:
+        return False
+    r = parse_requirement(requirement)
+    if r is None:
+        return True
+    op, rval = r
+    # attempt parsing
+    pv_c = _parse_ver(candidate_version)
+    pv_r = _parse_ver(rval)
+    if pv_c is None or pv_r is None:
+        # fallback: string compare if not parseable
+        if op == "==":
+            return str(candidate_version) == rval
+        if op == "!=":
+            return str(candidate_version) != rval
+        # other ops: be conservative -> False
+        return False
+    # if using packaging.Version, comparisons are natural
+    try:
+        if op == "==":
+            return pv_c == pv_r
+        if op == "!=":
+            return pv_c != pv_r
+        if op == ">":
+            return pv_c > pv_r
+        if op == "<":
+            return pv_c < pv_r
+        if op == ">=":
+            return pv_c >= pv_r
+        if op == "<=":
+            return pv_c <= pv_r
+    except Exception:
+        return False
+    return False
 
-
-# --- Graph class -------------------------------------------------------------
+# ----------------- Core DependencyGraph -----------------
 
 class DependencyGraph:
     """
-    Graph representation:
-      - nodes: dict name -> NodeInfo (metadata)
-      - edges: adjacency dict name -> list of Dependency (outgoing edges: package -> its deps)
+    Directed dependency graph.
+    adj: pkg -> list of (dep_pkg, requirement_str or None)
+    meta: pkg -> metadata dict (version, provides, conflicts, replaces, source, port_path, available_versions)
     """
 
-    def __init__(self):
-        self.nodes: Dict[str, NodeInfo] = {}
-        self.edges: Dict[str, List[Dependency]] = defaultdict(list)
-        self._reverse: Optional[Dict[str, Set[str]]] = None  # lazy reverse index
+    def __init__(self, persist: bool = True):
+        self.adj: Dict[str, List[Tuple[str, Optional[str]]]] = defaultdict(list)
+        self.meta: Dict[str, Dict[str, Any]] = {}
+        self.persist = persist
+        # reverse cache
+        self._reverse_cache: Optional[Dict[str, Set[str]]] = None
+        if persist:
+            self._load()
 
-    # Node operations
-    def add_node(self, name: str, info: Optional[NodeInfo] = None):
-        if name not in self.nodes:
-            self.nodes[name] = info or {}
-        else:
-            if info:
-                # merge metadata
-                self.nodes[name].update(info)
+    # --------------- persistence with simple file lock ----------------
+    def _acquire_lock(self, blocking: bool = True):
+        # lock with fcntl on LOCK_FILE
+        lf = open(str(LOCK_FILE), "a+")
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except Exception:
+            lf.close()
+            raise
+        return lf
+
+    def _release_lock(self, lf):
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        finally:
+            lf.close()
+
+    def _load(self):
+        if not PERSIST_FILE.exists():
+            return
+        lf = None
+        try:
+            lf = self._acquire_lock()
+            text = PERSIST_FILE.read_text(encoding="utf-8")
+            j = json.loads(text)
+            self.adj = defaultdict(list, {k: [(d, req) for d, req in v] for k, v in j.get("adj", {}).items()})
+            self.meta = j.get("meta", {})
+            self._reverse_cache = None
+            LOG.debug("DependencyGraph loaded from persist")
+        except Exception as e:
+            LOG.warning(f"Failed to load deps persistence: {e}")
+        finally:
+            if lf:
+                self._release_lock(lf)
+
+    def _save(self):
+        # atomic write with tmpfile, under file lock
+        lf = None
+        try:
+            lf = self._acquire_lock()
+            tmp = Path(str(PERSIST_FILE) + ".tmp")
+            data = {"adj": {k: v for k, v in self.adj.items()}, "meta": self.meta, "saved_at": time.time()}
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            tmp.replace(PERSIST_FILE)
+            LOG.debug("DependencyGraph persisted atomically")
+        except Exception as e:
+            LOG.warning(f"Failed to persist deps: {e}")
+        finally:
+            if lf:
+                self._release_lock(lf)
+
+    # --------------- graph modifications ----------------
+    def add_node(self, name: str, version: Optional[str] = None, provides: Optional[List[str]] = None,
+                 conflicts: Optional[List[str]] = None, replaces: Optional[List[str]] = None,
+                 source: Optional[str] = None, port_path: Optional[str] = None, available_versions: Optional[List[str]] = None):
+        if name not in self.adj:
+            self.adj[name] = []
+        m = self.meta.setdefault(name, {})
+        if version is not None:
+            m["version"] = version
+        if provides:
+            m.setdefault("provides", []).extend(x for x in provides if x not in m.get("provides", []))
+        if conflicts:
+            m.setdefault("conflicts", []).extend(x for x in conflicts if x not in m.get("conflicts", []))
+        if replaces:
+            m.setdefault("replaces", []).extend(x for x in replaces if x not in m.get("replaces", []))
+        if source:
+            m["source"] = source
+        if port_path:
+            m["port_path"] = port_path
+        if available_versions:
+            m["available_versions"] = available_versions
+        self._reverse_cache = None
+        if self.persist:
+            self._save()
+
+    def add_edge(self, pkg: str, dep: str, requirement: Optional[str] = None):
+        self.add_node(pkg)
+        self.add_node(dep)
+        # avoid exact duplicates
+        for (d, req) in self.adj[pkg]:
+            if d == dep and req == requirement:
+                return
+        self.adj[pkg].append((dep, requirement))
+        self._reverse_cache = None
+        if self.persist:
+            self._save()
 
     def remove_node(self, name: str):
-        if name in self.nodes:
-            del self.nodes[name]
-        if name in self.edges:
-            del self.edges[name]
-        # remove incoming edges
-        for k, deps in list(self.edges.items()):
-            newdeps = [d for d in deps if d.name != name]
-            self.edges[k] = newdeps
-        self._reverse = None
+        if name in self.adj:
+            del self.adj[name]
+        for k in list(self.adj.keys()):
+            self.adj[k] = [(d, r) for (d, r) in self.adj[k] if d != name]
+        if name in self.meta:
+            del self.meta[name]
+        self._reverse_cache = None
+        if self.persist:
+            self._save()
 
-    # Edge operations
-    def add_dependency(self, package: str, dep_name: str, constraint: Optional[str] = None, optional: bool = False):
-        self.add_node(package)
-        self.add_node(dep_name)
-        dep = Dependency(dep_name, constraint, optional)
-        # replace existing dependency to same name if present
-        deps = [d for d in self.edges[package] if d.name != dep_name]
-        deps.append(dep)
-        self.edges[package] = deps
-        self._reverse = None
+    def remove_edge(self, pkg: str, dep: str):
+        if pkg in self.adj:
+            self.adj[pkg] = [(d, r) for (d, r) in self.adj[pkg] if d != dep]
+        self._reverse_cache = None
+        if self.persist:
+            self._save()
 
-    def remove_dependency(self, package: str, dep_name: str):
-        if package in self.edges:
-            self.edges[package] = [d for d in self.edges[package] if d.name != dep_name]
-            self._reverse = None
+    # --------------- queries ----------------
+    def nodes(self) -> List[str]:
+        return list(self.adj.keys())
 
-    def get_dependencies(self, package: str) -> List[Dependency]:
-        return list(self.edges.get(package, []))
+    def edges(self) -> List[Tuple[str, str, Optional[str]]]:
+        out = []
+        for n, lst in self.adj.items():
+            for (d, r) in lst:
+                out.append((n, d, r))
+        return out
 
-    def get_node_info(self, package: str) -> NodeInfo:
-        return self.nodes.get(package, {})
+    # reverse dependencies (immediate or recursive)
+    def _build_reverse_cache(self):
+        r = defaultdict(set)
+        for src, deps in self.adj.items():
+            for dst, _ in deps:
+                r[dst].add(src)
+        self._reverse_cache = r
 
-    # Reverse index
-    def _build_reverse(self):
-        rev: Dict[str, Set[str]] = defaultdict(set)
-        for pkg, deps in self.edges.items():
-            for d in deps:
-                rev[d.name].add(pkg)
-        self._reverse = rev
-
-    def reverse_dependencies(self, package: str) -> Set[str]:
-        """Return set of packages that (directly) depend on the given package."""
-        if self._reverse is None:
-            self._build_reverse()
-        return set(self._reverse.get(package, set()))
-
-    # Transitive reverse (who depends on X recursively)
-    def reverse_dependencies_transitive(self, package: str) -> Set[str]:
-        result: Set[str] = set()
-        q = deque([package])
-        if self._reverse is None:
-            self._build_reverse()
+    def reverse_dependencies(self, name: str, recursive: bool = True) -> List[str]:
+        if self._reverse_cache is None:
+            self._build_reverse_cache()
+        out = set()
+        q = deque([name])
         while q:
-            p = q.popleft()
-            for parent in self._reverse.get(p, set()):
-                if parent not in result:
-                    result.add(parent)
-                    q.append(parent)
-        return result
+            cur = q.popleft()
+            for p in self._reverse_cache.get(cur, set()):
+                if p not in out:
+                    out.add(p)
+                    if recursive:
+                        q.append(p)
+        return sorted(out)
 
-    # Topological sort (Kahn), returning ordered list of nodes for installation:
-    # dependencies come before dependents. Raises CycleError if cycle detected.
-    def install_order(self, targets: Optional[Iterable[str]] = None, include_optional: bool = True) -> List[str]:
-        """
-        Compute installation order for the given targets (or all nodes if None).
-        If include_optional=False optional dependencies are treated as absent.
-        """
-        # Build reduced graph
-        if targets is None:
-            nodes = set(self.nodes.keys())
-        else:
-            # include targets plus all their transitive deps
-            nodes = set()
-            for t in targets:
-                if t not in self.nodes:
-                    raise DependencyError(f"Unknown package: {t}")
-                self._collect_deps_recursive(t, nodes, include_optional)
-        # compute in-degree
-        indeg: Dict[str, int] = {n: 0 for n in nodes}
-        adj: Dict[str, List[str]] = {n: [] for n in nodes}
-        for pkg in nodes:
-            for d in self.edges.get(pkg, []):
-                if (not include_optional) and d.optional:
+    # --------------- topological sort + cycle detection ----------------
+    def topological_sort(self, subset: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+        nodes = set(subset) if subset is not None else set(self.adj.keys())
+        indeg = {n: 0 for n in nodes}
+        missing = set()
+        for n in nodes:
+            for (dst, _) in self.adj.get(n, []):
+                if dst not in nodes:
+                    missing.add(dst)
                     continue
-                if d.name in nodes:
-                    indeg[d.name] += 1
-                    adj[pkg].append(d.name)
-
-        # Kahn's algorithm BUT note topological order we want deps before dependents
-        # So edges should be dep->pkg. We built edges pkg->dep, so invert.
-        # Instead compute incoming counts based on reversed edges:
-        # Recompute indeg_rev: count incoming edges from deps (i.e., number of deps for each node)
-        indeg_rev = {n: 0 for n in nodes}
-        rev_adj = {n: [] for n in nodes}  # dep -> list of packages that depend on it
-        for pkg in nodes:
-            for d in self.edges.get(pkg, []):
-                if (not include_optional) and d.optional:
-                    continue
-                if d.name in nodes:
-                    indeg_rev[pkg] += 1
-                    rev_adj.setdefault(d.name, []).append(pkg)
-
-        q = deque([n for n, deg in indeg_rev.items() if deg == 0])
-        order: List[str] = []
+                indeg[dst] = indeg.get(dst, 0) + 1
+        q = deque([n for n, d in indeg.items() if d == 0])
+        order = []
         while q:
             n = q.popleft()
             order.append(n)
-            for dependent in rev_adj.get(n, []):
-                indeg_rev[dependent] -= 1
-                if indeg_rev[dependent] == 0:
-                    q.append(dependent)
-
+            for (dst, _) in self.adj.get(n, []):
+                if dst not in nodes:
+                    continue
+                indeg[dst] -= 1
+                if indeg[dst] == 0:
+                    q.append(dst)
         if len(order) != len(nodes):
-            # find cycle (simple heuristic using DFS)
-            cycle = self._find_cycle(nodes, include_optional)
-            raise CycleError(cycle)
-        return order
+            cycles = self._find_cycles(nodes)
+            return {"order": order, "cycles": cycles, "missing": sorted(list(missing))}
+        return {"order": order, "cycles": [], "missing": sorted(list(missing))}
 
-    def _collect_deps_recursive(self, pkg: str, out_set: Set[str], include_optional: bool):
-        if pkg in out_set:
-            return
-        out_set.add(pkg)
-        for d in self.edges.get(pkg, []):
-            if (not include_optional) and d.optional:
-                continue
-            self._collect_deps_recursive(d.name, out_set, include_optional)
+    def _find_cycles(self, nodes: Set[str]) -> List[List[str]]:
+        visited = set()
+        onstack = set()
+        stack = []
+        cycles = []
 
-    def uninstall_order(self, targets: Iterable[str]) -> List[str]:
-        """
-        Determine a safe uninstall order for the given targets:
-        remove dependents before dependencies (reverse of install order of full affected set).
-        """
-        # Build full affected set: targets + their transitive reverse deps (i.e. packages that depend on them)
-        affected: Set[str] = set(targets)
-        for t in list(targets):
-            affected |= self.reverse_dependencies_transitive(t)
+        def dfs(u):
+            visited.add(u)
+            onstack.add(u)
+            stack.append(u)
+            for (v, _) in self.adj.get(u, []):
+                if v not in nodes:
+                    continue
+                if v not in visited:
+                    dfs(v)
+                elif v in onstack:
+                    # extract cycle
+                    try:
+                        idx = stack.index(v)
+                        cycles.append(stack[idx:].copy())
+                    except ValueError:
+                        pass
+            stack.pop()
+            onstack.remove(u)
 
-        # Compute an install order for affected set, then reverse it for uninstall
-        order = self.install_order(targets=affected, include_optional=True)
-        # uninstall dependents first -> reverse
-        return list(reversed(order))
+        for n in nodes:
+            if n not in visited:
+                dfs(n)
+        return cycles
 
-    def detect_conflicts(self) -> List[Tuple[str, List[Dependency]]]:
-        """
-        Find cases where multiple packages require conflicting constraints on same package.
-        Returns list of tuples (dep_name, [Dependency entries from different packages])
-        """
-        conflicts: List[Tuple[str, List[Dependency]]] = []
-        # gather constraints per dep
-        per_dep: Dict[str, List[Dependency]] = defaultdict(list)
-        for pkg, deps in self.edges.items():
-            for d in deps:
-                per_dep[d.name].append(Dependency(pkg + "->" + d.name, d.constraint, d.optional))
-        # check pairwise compatibility
-        for dep_name, reqs in per_dep.items():
-            # if only one requester -> no conflict
-            if len(reqs) <= 1:
-                continue
-            # naive compatibility check: try to find any version satisfying all constraints
-            # If packaging available, we can check intersection of SpecifierSets
-            if _HAS_PACKAGING:
-                # start with open SpecifierSet
-                combined = None
-                compatible = True
-                for r in reqs:
-                    spec = r.constraint
-                    if spec is None:
-                        continue
-                    sset = SpecifierSet(spec)
-                    if combined is None:
-                        combined = sset
-                    else:
-                        # intersection cannot be tested directly; we test by sampling a set of candidate versions?
-                        # Simpler heuristic: test arbitrary versions? instead detect if combined & sset empty via strings -> best-effort
-                        combined = SpecifierSet(str(combined) + "," + str(sset))
-                # We won't try to sample versions; assume compatible unless obviously contradictory equality
-                # Check for direct contradictions like "==1.0" and "==2.0"
-                eqs = set()
-                for r in reqs:
-                    c = r.constraint
-                    if c and "==" in c:
-                        parts = [p.strip() for p in c.split(",") if p.strip().startswith("==")]
-                        for p in parts:
-                            eqs.add(p[2:])
-                if len(eqs) > 1:
-                    conflicts.append((dep_name, reqs))
-            else:
-                # fallback: if there are differing equality constraints treat as conflict
-                eqs = set()
-                for r in reqs:
-                    c = r.constraint
-                    if c and c.startswith("=="):
-                        eqs.add(c[2:])
-                if len(eqs) > 1:
-                    conflicts.append((dep_name, reqs))
+    # --------------- conflict detection ----------------
+    def detect_conflicts(self, subset: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
+        nodes = set(subset) if subset is not None else set(self.adj.keys())
+        conflicts = []
+        for n in nodes:
+            # collect requirements on n from parents inside nodes
+            reqs = []
+            for parent in nodes:
+                for (dst, req) in self.adj.get(parent, []):
+                    if dst == n:
+                        reqs.append((parent, req))
+            # if multiple different requirements that cannot be satisfied simultaneously, record conflict
+            for i in range(len(reqs)):
+                for j in range(i + 1, len(reqs)):
+                    r1 = reqs[i][1]; r2 = reqs[j][1]
+                    if r1 and r2 and r1 != r2:
+                        conflicts.append({"node": n, "requirements": [reqs[i], reqs[j]]})
         return conflicts
 
-    # Utilities: find a cycle (DFS)
-    def _find_cycle(self, nodes_subset: Optional[Set[str]] = None, include_optional: bool = True) -> List[str]:
-        if nodes_subset is None:
-            nodes_subset = set(self.nodes.keys())
-        visited: Set[str] = set()
-        stack: List[str] = []
+    # --------------- resolution (attempt to choose versions and order) ----------------
+    def resolve(self, root: str, include_optional: bool = False) -> Dict[str, Any]:
+        """
+        Attempt to resolve dependencies for 'root' and return installation order.
+        Returns dict:
+          - ok: bool
+          - order: list of packages in install order (root's dependencies first)
+          - missing: referenced but absent packages
+          - cycles: list of cycles if any
+          - conflicts: list of conflicts if any
+          - details: deeper diagnostics
+        """
+        if root not in self.adj:
+            return {"ok": False, "message": f"root '{root}' not in graph", "order": [], "missing": [], "cycles": [], "conflicts": []}
 
-        def dfs(node: str, path: List[str], visiting: Set[str]) -> Optional[List[str]]:
-            visiting.add(node)
-            path.append(node)
-            for d in self.edges.get(node, []):
-                if (not include_optional) and d.optional:
-                    continue
-                if d.name not in nodes_subset:
-                    continue
-                if d.name in visiting:
-                    # cycle found
-                    idx = path.index(d.name) if d.name in path else 0
-                    return path[idx:] + [d.name]
-                if d.name not in visited:
-                    res = dfs(d.name, path, visiting)
-                    if res:
-                        return res
-            visiting.remove(node)
-            visited.add(node)
-            path.pop()
-            return None
-
-        for n in list(nodes_subset):
+        # gather reachable nodes
+        visited = set()
+        stack = [root]
+        while stack:
+            n = stack.pop()
             if n in visited:
                 continue
-            res = dfs(n, [], set())
-            if res:
-                return res
-        return []
+            visited.add(n)
+            for (dep, _) in self.adj.get(n, []):
+                stack.append(dep)
 
-    # Export / Import
-    def to_dict(self) -> Dict[str, Any]:
-        return {"nodes": self.nodes, "edges": {k: [{"name": d.name, "constraint": d.constraint, "optional": d.optional} for d in v] for k, v in self.edges.items()}}
+        # detect cycles
+        topo = self.topological_sort(subset=visited)
+        cycles = topo.get("cycles", [])
+        missing = topo.get("missing", [])
+        if cycles:
+            return {"ok": False, "message": "cycles detected", "order": topo.get("order", []), "missing": missing, "cycles": cycles, "conflicts": []}
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "DependencyGraph":
-        g = cls()
-        for n, info in (data.get("nodes") or {}).items():
-            g.add_node(n, info)
-        for pkg, deps in (data.get("edges") or {}).items():
-            for d in deps:
-                g.add_dependency(pkg, d["name"], d.get("constraint"), d.get("optional", False))
-        return g
+        # detect conflicts
+        conflicts = self.detect_conflicts(subset=visited)
+        if conflicts:
+            return {"ok": False, "message": "conflicts detected", "order": topo.get("order", []), "missing": missing, "cycles": [], "conflicts": conflicts}
 
-    def save_json(self, path: Path):
-        path.write_text(json.dumps(self.to_dict(), indent=2))
+        # If here, we can produce order: topo.order but we want dependencies first => reverse
+        order = topo.get("order", [])
+        # topological_sort returns nodes where edges point to dependencies (pkg -> dep). The order from Kahn puts packages before deps? We used indegree count as edges into dst -> so order yields nodes with zero indegree first: roots before deps. We want install deps before dependents: reverse order.
+        install_order = list(reversed(order))
+        return {"ok": True, "order": install_order, "missing": missing, "cycles": [], "conflicts": []}
 
-    @classmethod
-    def load_json(cls, path: Path) -> "DependencyGraph":
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return cls.from_dict(data)
+    # --------------- ports tree import ----------------
+    def _parse_dep_item(self, dep) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Parse dependency item from portfile:
+         - dict form: {"name": "pkg", "version": ">=1.2"}
+         - string form: "pkg>=1.2" or "pkg"
+        Returns (depname, requirement)
+        """
+        if isinstance(dep, dict):
+            name = dep.get("name") or dep.get("pkg") or dep.get("package")
+            req = dep.get("version") or dep.get("requirement")
+            return (name, req)
+        s = str(dep)
+        for op in (">=", "<=", "==", "!=", ">", "<"):
+            if op in s:
+                parts = s.split(op, 1)
+                return (parts[0].strip(), op + parts[1].strip())
+        return (s.strip(), None)
 
-    # Graphviz dot export
-    def to_dot(self, include_optional: bool = True) -> str:
-        lines = ["digraph dependency_graph {", "  rankdir=LR;"]
-        for n in self.nodes:
+    def load_ports_tree(self, ports_root: Optional[str] = None, pattern: str = "Portfile.yaml"):
+        """
+        Scan ports tree and load node metadata and edges.
+        Supports common keys: name, version, depends, depends_build, depends_run, depends_lib, provides, conflicts, replaces
+        """
+        root = Path(ports_root or PORTS_ROOT_DEFAULT)
+        if not root.exists():
+            LOG.warning(f"ports root not found: {root}")
+            return
+
+        if yaml is None:
+            LOG.warning("pyyaml not available: cannot parse Portfile.yaml")
+            return
+
+        count = 0
+        for pf in root.rglob(pattern):
+            try:
+                data = yaml.safe_load(pf.read_text(encoding="utf-8")) or {}
+                name = data.get("name") or data.get("pkgname") or pf.parent.name
+                version = data.get("version") or data.get("pkgver")
+                provides = data.get("provides") or data.get("provides_list") or []
+                conflicts = data.get("conflicts") or []
+                replaces = data.get("replaces") or []
+                self.add_node(name, version=version, provides=provides, conflicts=conflicts,
+                              replaces=replaces, source=data.get("homepage"), port_path=str(pf.parent))
+                # collect dependency lists
+                for key in ("depends", "depends_build", "depends_run", "depends_lib", "depends_pkg"):
+                    deps = data.get(key, []) or []
+                    if isinstance(deps, str):
+                        deps = [deps]
+                    for dep in deps:
+                        depname, req = self._parse_dep_item(dep)
+                        if depname:
+                            self.add_edge(name, depname, requirement=req)
+                count += 1
+            except Exception as e:
+                LOG.debug(f"failed parsing {pf}: {e}")
+        LOG.info(f"Loaded {count} portfiles into dependency graph")
+        if self.persist:
+            self._save()
+
+    # --------------- export ----------------
+    def export_dot(self, out_file: Path, subset: Optional[Iterable[str]] = None):
+        nodes = set(subset) if subset is not None else set(self.adj.keys())
+        lines = ["digraph pyport_deps {"]
+        for n in sorted(nodes):
             label = n
-            info = self.nodes.get(n) or {}
-            v = info.get("version")
-            if v:
-                label = f"{n}\\n{v}"
-            lines.append(f'  "{n}" [label="{label}"];')
-        for pkg, deps in self.edges.items():
-            for d in deps:
-                if (not include_optional) and d.optional:
+            ver = self.meta.get(n, {}).get("version")
+            if ver:
+                lines.append(f'  "{n}" [label="{label}\\n{ver}"];')
+            else:
+                lines.append(f'  "{n}";')
+        for n in sorted(nodes):
+            for (dst, req) in self.adj.get(n, []):
+                if dst not in nodes:
                     continue
-                lbl = d.constraint or ""
-                style = "dashed" if d.optional else "solid"
-                lines.append(f'  "{pkg}" -> "{d.name}" [label="{lbl}", style="{style}"];')
+                attr = f' [label="{req}"]' if req else ""
+                lines.append(f'  "{n}" -> "{dst}"{attr};')
         lines.append("}")
-        return "\n".join(lines)
+        out_file.write_text("\n".join(lines), encoding="utf-8")
+        LOG.info(f"DOT written to {out_file}")
 
+    def export_json(self, out_file: Path):
+        data = {"adj": {k: v for k, v in self.adj.items()}, "meta": self.meta}
+        out_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        LOG.info(f"JSON export written to {out_file}")
 
-# --- Utilities for building graph from portfile dir --------------------------
+    # --------------- utility & diagnostics ----------------
+    def find_providers(self, virtual_name: str) -> List[str]:
+        """
+        Return list of nodes that provide virtual_name (search 'provides' metadata).
+        """
+        out = []
+        for n, meta in self.meta.items():
+            prov = meta.get("provides", [])
+            if virtual_name in prov:
+                out.append(n)
+        return out
 
-def build_graph_from_portfiles(ports_root: Path, pattern: str = "**/portfile.yaml") -> DependencyGraph:
-    """
-    Walk ports_root and construct a dependency graph using fields in each portfile.
-    Expected portfile keys: name, version, depends (list of strings or dicts {name, constraint, optional})
-    """
-    g = DependencyGraph()
-    for pf in ports_root.glob(pattern):
+    def find_best_version(self, pkg: str, requirement: Optional[str]) -> Optional[str]:
+        """
+        Given pkg and requirement (string like '>=1.2'), pick best available version
+        from meta[pkg].get('available_versions') or meta[pkg].get('version').
+        Returns selected version string or None if not satisfiable.
+        """
+        meta = self.meta.get(pkg, {})
+        candidates = []
+        if "available_versions" in meta:
+            candidates = list(meta["available_versions"])
+        elif "version" in meta:
+            candidates = [meta["version"]]
+        if not candidates:
+            return None
+        # sort candidates descending and pick first that satisfies requirement
         try:
-            raw = json.loads(Path(pf).read_text()) if pf.suffix.lower() == ".json" else Path(pf).read_text(encoding="utf-8")
-            try:
-                # try YAML parse if available
-                import yaml as _yaml  # type: ignore
-                meta = _yaml.safe_load(raw)
-            except Exception:
-                # fallback to simple key: value parser? assume JSON-like already handled
-                meta = {}
+            # parse and sort using PV if available
+            if PV:
+                parsed = [(PV(v), v) for v in candidates]
+                parsed.sort(reverse=True)
+                for pv, v in parsed:
+                    if satisfies(v, requirement):
+                        return v
+            else:
+                # fallback: try numeric tuple parse
+                def keyf(s):
+                    p = _parse_ver(s)
+                    return p
+                candidates.sort(key=keyf, reverse=True)
+                for v in candidates:
+                    if satisfies(v, requirement):
+                        return v
         except Exception:
-            # try YAML directly
-            try:
-                import yaml as _yaml  # type: ignore
-                meta = _yaml.safe_load(pf.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-        if not meta:
-            continue
-        name = meta.get("name") or pf.parent.name
-        version = meta.get("version") or meta.get("pkgver")
-        g.add_node(name, {"version": version, "portfile": str(pf)})
-        deps = meta.get("depends") or []
-        # normalise depends: strings or dicts
-        for d in deps:
-            if isinstance(d, str):
-                # allow "pkgname" or "pkgname>=1.2"
-                if any(op in d for op in [">=", "<=", "==", ">", "<"]):
-                    # crude split: first token is name until comparator
-                    import re
-                    m = re.match(r"^([A-Za-z0-9_\-+.]+)\s*(.*)$", d)
-                    if m:
-                        pkgname = m.group(1)
-                        constraint = m.group(2).strip()
-                        g.add_dependency(name, pkgname, constraint, False)
-                    else:
-                        g.add_dependency(name, d, None, False)
-                else:
-                    g.add_dependency(name, d, None, False)
-            elif isinstance(d, dict):
-                depname = d.get("name")
-                constraint = d.get("constraint") or d.get("version") or None
-                optional = bool(d.get("optional", False))
-                g.add_dependency(name, depname, constraint, optional)
-    return g
+            # last-resort linear scan
+            for v in candidates:
+                if satisfies(v, requirement):
+                    return v
+        return None
 
+    # --------------- self-test (basic sanity) ----------------
+    def self_test(self) -> bool:
+        # simple tests: add nodes, edges, detect cycle, topo order
+        try:
+            g = DependencyGraph(persist=False)
+            g.add_node("A"); g.add_node("B"); g.add_node("C")
+            g.add_edge("A", "B"); g.add_edge("B", "C")
+            res = g.topological_sort()
+            if not res or "cycles" in res and res["cycles"]:
+                LOG.error("self_test topo failed: unexpected cycle")
+                return False
+            # create cycle
+            g.add_edge("C", "A")
+            res2 = g.topological_sort()
+            if not res2.get("cycles"):
+                LOG.error("self_test failed to detect cycle")
+                return False
+            LOG.info("dependency.self_test passed")
+            return True
+        except Exception as e:
+            LOG.error(f"self_test error: {e}")
+            return False
 
-# --- CLI for quick usage -----------------------------------------------------
+# ----------------- CLI -----------------
 
 def _cli():
     import argparse
-    parser = argparse.ArgumentParser(prog="dependency.py", description="Dependency graph manager for PyPort")
-    sub = parser.add_subparsers(dest="cmd")
+    parser = argparse.ArgumentParser(prog="pyport-deps", description="Advanced dependency manager for PyPort")
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
-    s_build = sub.add_parser("build", help="build graph from a ports directory")
-    s_build.add_argument("ports_dir", nargs="?", default="/usr/ports")
+    p_res = sub.add_parser("resolve", help="Resolve dependencies for a package")
+    p_res.add_argument("pkg")
 
-    s_order = sub.add_parser("install-order", help="show install order for targets")
-    s_order.add_argument("targets", nargs="*", help="target package names")
-    s_order.add_argument("--graph-file", help="load graph JSON file")
+    p_rev = sub.add_parser("reverse", help="Show reverse dependencies")
+    p_rev.add_argument("pkg")
 
-    s_uninstall = sub.add_parser("uninstall-order", help="show uninstall order for targets")
-    s_uninstall.add_argument("targets", nargs="+")
-    s_cycles = sub.add_parser("cycles", help="detect cycles")
-    s_cycles.add_argument("--graph-file", help="load graph JSON file")
+    p_top = sub.add_parser("topo", help="Topological sort (global or subset)")
+    p_top.add_argument("--subset", nargs="*", help="Nodes subset (optional)")
 
-    s_conf = sub.add_parser("conflicts", help="detect conflicts in constraints")
-    s_conf.add_argument("--graph-file", help="load graph JSON file")
+    p_add = sub.add_parser("add-port", help="Add node with metadata")
+    p_add.add_argument("name")
+    p_add.add_argument("--version")
+    p_add.add_argument("--provides", nargs="*", default=[])
+    p_add.add_argument("--available-versions", nargs="*", default=[])
+    p_add.add_argument("--source")
+    p_add.add_argument("--port-path")
 
-    s_dot = sub.add_parser("dot", help="export graph as DOT")
-    s_dot.add_argument("--graph-file", help="load graph JSON file")
-    s_dot.add_argument("--out", help="write to file")
+    p_edge = sub.add_parser("add-edge", help="Add dependency edge: A depends_on B")
+    p_edge.add_argument("pkg")
+    p_edge.add_argument("dep")
+    p_edge.add_argument("--req", help="requirement string like >=1.2")
+
+    p_load = sub.add_parser("load-ports", help="Load ports tree into graph")
+    p_load.add_argument("--root", help="Ports root folder (default from config)")
+
+    p_vis = sub.add_parser("visualize", help="Export DOT file")
+    p_vis.add_argument("out")
+
+    p_export = sub.add_parser("export-json", help="Export graph to JSON file")
+    p_export.add_argument("out")
+
+    p_test = sub.add_parser("self-test", help="Run internal self-tests")
 
     args = parser.parse_args()
+    dg = DependencyGraph(persist=True)
 
-    g: DependencyGraph
-    if getattr(args, "graph_file", None):
-        g = DependencyGraph.load_json(Path(args.graph_file))
-    elif args.cmd == "build":
-        g = build_graph_from_portfiles(Path(args.ports_dir))
-        out = Path("dependency_graph.json")
-        g.save_json(out)
-        print("Saved graph to", out)
-    else:
-        # if not build and no file provided, try load default
-        default = Path("dependency_graph.json")
-        if default.exists():
-            g = DependencyGraph.load_json(default)
-        else:
-            print("No graph file found. Run 'build' first or pass --graph-file")
-            sys.exit(1)
-
-    if args.cmd == "install-order":
-        tars = args.targets or None
-        try:
-            order = g.install_order(targets=tars)
-            print("Install order:")
-            for o in order:
-                info = g.get_node_info(o)
-                ver = info.get("version")
-                print(f"  {o}" + (f" ({ver})" if ver else ""))
-        except CycleError as e:
-            print("Cycle detected:", e)
-
-    elif args.cmd == "uninstall-order":
-        try:
-            order = g.uninstall_order(args.targets)
-            print("Uninstall order:")
-            for o in order:
-                print(" ", o)
-        except Exception as e:
-            print("Error:", e)
-
-    elif args.cmd == "cycles":
-        cyc = g._find_cycle()
-        if cyc:
-            print("Cycle:", " -> ".join(cyc))
-        else:
-            print("No cycles detected")
-
-    elif args.cmd == "conflicts":
-        cs = g.detect_conflicts()
-        if not cs:
-            print("No conflicts detected")
-        else:
-            for dep_name, reqs in cs:
-                print(f"Conflict on {dep_name}:")
-                for r in reqs:
-                    print("  ", r)
-
-    elif args.cmd == "dot":
-        dot = g.to_dot()
-        if args.out:
-            Path(args.out).write_text(dot)
-            print("Wrote DOT to", args.out)
-        else:
-            print(dot)
+    if args.cmd == "resolve":
+        res = dg.resolve(args.pkg)
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+    elif args.cmd == "reverse":
+        r = dg.reverse_dependencies(args.pkg)
+        print(json.dumps(r, indent=2, ensure_ascii=False))
+    elif args.cmd == "topo":
+        subset = args.subset if args.subset else None
+        res = dg.topological_sort(subset)
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+    elif args.cmd == "add-port":
+        dg.add_node(args.name, version=args.version, provides=args.provides,
+                    available_versions=args.available_versions, source=args.source, port_path=args.port_path)
+        print("ok")
+    elif args.cmd == "add-edge":
+        dg.add_edge(args.pkg, args.dep, requirement=args.req)
+        print("ok")
+    elif args.cmd == "load-ports":
+        dg.load_ports_tree(ports_root=args.root)
+        print("ok")
+    elif args.cmd == "visualize":
+        dg.export_dot(Path(args.out))
+        print("ok")
+    elif args.cmd == "export-json":
+        dg.export_json(Path(args.out))
+        print("ok")
+    elif args.cmd == "self-test":
+        ok = dg.self_test()
+        print("self-test ok" if ok else "self-test failed")
+        exit(0 if ok else 2)
 
 if __name__ == "__main__":
     _cli()
