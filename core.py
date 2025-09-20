@@ -1,246 +1,325 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-pyport core module - evolved version ++
+core.py - Núcleo avançado do PyPort
 
-Coordena todo o ciclo de vida de um port:
-- Leitura do Portfile.yaml
-- Resolução de dependências
-- Criação e destruição de sandbox
-- Download de fontes (http, ftp, git, múltiplos)
-- Descompactação automática
-- Aplicação de patches
-- Execução de hooks
-- Construção via autotools, python, rust, java ou custom
-- Empacotamento com packager.py
-- Instalação e remoção limpa com DB
-- Logs persistentes
+Versão evoluída: coordena todo o ciclo de vida de um port,
+com compatibilidade total com módulos: logger, config, dependency, fetch, extract, patch,
+configure, compile, install, remove, hooks, packager, sandbox.
+
+Funções principais: build, remove, sync, info, list
 """
 
-import os, sys, shutil, subprocess, tempfile, json
+from __future__ import annotations
+import os
+import sys
+import json
+import time
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any
+
 import yaml
 
-from sandbox import create_sandbox, run_in_sandbox, destroy_sandbox
-from packager import package_from_metadata
+from pyport.logger import get_logger
+from pyport.config import get_config
+from pyport.dependency import DependencyGraph
+from pyport.fetch import fetch_sources
+from pyport.extract import extract_sources
+from pyport.patch import apply_patches
+from pyport.configure import configure
+from pyport.compile import compile_port
+from pyport.packager import package_from_metadata
+from pyport.install import install_package
+from pyport.remove import remove_package
+from pyport.hooks import run_hook
+from pyport.sandbox import Sandbox
 
+LOG = get_logger("pyport.core")
 
-# diretórios principais
-PORTFILES_ROOT = Path("/usr/ports")
-PATCHES_DIRNAME = "patches"
-PKG_DB = Path("/pyport/db")
-PKG_DB.mkdir(parents=True, exist_ok=True)
-INSTALLED_DB = PKG_DB / "installed.json"
-
-LOG_DIR = Path("/pyport/logs")
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def log(msg: str, pkg: str = None):
-    print(f"[core] {msg}")
-    if pkg:
-        with open(LOG_DIR / f"{pkg}.log", "a") as f:
-            f.write(msg + "\n")
-
-
-def load_installed_db() -> Dict[str, Any]:
-    if INSTALLED_DB.exists():
-        return json.loads(INSTALLED_DB.read_text())
-    return {}
-
-
-def save_installed_db(db: Dict[str, Any]):
-    INSTALLED_DB.write_text(json.dumps(db, indent=2))
-
-
-def load_portfile(portfile: Path) -> Dict[str, Any]:
-    with open(portfile) as f:
-        return yaml.safe_load(f)
-
-
-def resolve_dependencies(deps: List[str]):
-    for dep in deps:
-        log(f"checando dependência: {dep}")
-        # aqui pode chamar build_port recursivo
-    return True
-
-
-def run_cmd(cmd: List[str], cwd: Path = None):
-    subprocess.run(cmd, cwd=cwd, check=True)
-
-
-def download_sources(sources: List[str], workdir: Path):
+class Core:
     """
-    Baixa múltiplas fontes (http, ftp, git).
+    Classe central para operações principais do PyPort
     """
-    for src in sources:
-        if src.startswith("git+"):
-            url = src[4:]
-            log(f"clonando git {url}")
-            run_cmd(["git", "clone", "--depth", "1", url], cwd=workdir)
-        else:
-            filename = src.split("/")[-1]
-            dest = workdir / filename
-            if not dest.exists():
-                log(f"baixando {src}")
+
+    def __init__(self):
+        self.cfg = get_config()
+        self.ports_root = Path(self.cfg["paths"]["ports"])
+        self.sandbox_root = Path(self.cfg["paths"]["sandbox"])
+        self.installed_db_path = Path(self.cfg["paths"]["db"]) / "installed.json"
+
+    def load_installed(self) -> Dict[str, Any]:
+        if self.installed_db_path.exists():
+            try:
+                return json.loads(self.installed_db_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                LOG.error(f"Erro lendo DB instalado: {e}")
+        return {}
+
+    def save_installed(self, db: Dict[str, Any]):
+        self.installed_db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.installed_db_path.write_text(json.dumps(db, indent=2), encoding="utf-8")
+
+    def is_installed(self, name: str) -> bool:
+        db = self.load_installed()
+        return name in db
+
+    def build(self, portname: str, force: bool = False, dry_run: bool = False) -> bool:
+        name = portname
+        LOG.info(f"Build iniciado: {name}, force={force}, dry_run={dry_run}")
+
+        # Carregar portfile
+        pf = self.ports_root / portname / "Portfile.yaml"
+        if not pf.exists():
+            LOG.error(f"Portfile não encontrado: {pf}")
+            return False
+
+        try:
+            meta = yaml.safe_load(pf.read_text(encoding="utf-8"))
+        except Exception as e:
+            LOG.error(f"Erro lendo Portfile {pf}: {e}")
+            return False
+
+        version = meta.get("version", "unknown")
+
+        # Verificar se já instalado
+        if self.is_installed(name) and not force:
+            LOG.info(f"{name} já instalado (versão possivelmente {version}), pulando build.")
+            return True
+
+        # Resolver dependências
+        dg = DependencyGraph(persist=True)
+        dg.load_ports_tree(self.ports_root)
+        res = dg.resolve(name)
+        if not res.get("ok", False):
+            LOG.error(f"Falha na resolução de dependências para {name}")
+            LOG.debug(f"Missing: {res.get('missing')}, cycles: {res.get('cycles')}, conflicts: {res.get('conflicts')}")
+            return False
+
+        # Construir dependências primeiro
+        for dep in res["order"]:
+            if dep == name:
+                continue
+            LOG.info(f"Construindo dependência: {dep}")
+            if not self.build(dep, force=force, dry_run=dry_run):
+                LOG.error(f"Falha ao construir dependência {dep}")
+                return False
+
+        # Preparar sandbox
+        sandbox_dir = self.sandbox_root / f"{name}-{version}"
+        sb = Sandbox(str(sandbox_dir), force_clean=force)
+        try:
+            sb.prepare()
+        except Exception as e:
+            LOG.error(f"Falha ao preparar sandbox para {name}: {e}")
+            return False
+
+        try:
+            # executar hook de início
+            run_hook(meta, "pre_build_start", sb)
+
+            # Fetch
+            fetched = fetch_sources(meta)
+            if not fetched:
+                LOG.error(f"Fetch falhou para {name}")
+                return False
+
+            # Extract
+            extracted = extract_sources(meta, fetched, sandbox=sb, force=force)
+            if not extracted:
+                LOG.error(f"Extração falhou para {name}")
+                return False
+
+            # Patch
+            if not apply_patches(meta, extracted, sandbox=sb):
+                LOG.error(f"Patches falharam para {name}")
+                return False
+
+            # Hooks
+            run_hook(meta, "pre_configure", sb)
+
+            # Configure
+            configure(meta, extracted, sandbox=sb, force=force)
+
+            # pre_build hook
+            run_hook(meta, "pre_build", sb)
+
+            # Compile
+            compile_port(meta, extracted, sandbox=sb, force=force)
+
+            # post_build hook
+            run_hook(meta, "post_build", sb)
+
+            # pre_install hook
+            run_hook(meta, "pre_install", sb)
+
+            # Empacotar
+            metadata_file = sb.write_metadata(name, version, meta)
+            pkg = package_from_metadata(metadata_file)
+            LOG.info(f"Pacote criado: {pkg}")
+
+            # Instalar se não dry_run
+            if not dry_run:
+                install_package(pkg, sandbox=sb, force=force, dry_run=dry_run)
+
+            # post_install hook
+            run_hook(meta, "post_install", sb)
+
+            # hook de fim
+            run_hook(meta, "post_build_end", sb)
+
+            # Marcar instalado no DB
+            db = self.load_installed()
+            db[name] = {"version": version, "pkg": str(pkg), "built_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+            self.save_installed(db)
+
+            LOG.info(f"Build de {name} finalizado com sucesso.")
+
+            # notificação se configurado
+            if self.cfg.get("notify", {}).get("enabled", False):
                 try:
-                    run_cmd(["wget", "-c", src], cwd=workdir)
+                    from pyport.core import _notify
+                    _notify(f"PyPort: Build de {name} concluído")
                 except Exception:
-                    run_cmd(["curl", "-L", "-O", src], cwd=workdir)
-            extract_if_archive(dest, workdir)
+                    pass
 
+            return True
 
-def extract_if_archive(filepath: Path, workdir: Path):
-    """
-    Detecta e extrai formatos comuns.
-    """
-    if filepath.suffixes[-2:] in [[".tar", ".gz"], [".tar", ".xz"], [".tar", ".bz2"], [".tar", ".zst"]]:
-        log(f"extraindo {filepath.name}")
-        run_cmd(["tar", "xf", str(filepath)], cwd=workdir)
-    elif filepath.suffix == ".zip":
-        log(f"extraindo {filepath.name}")
-        run_cmd(["unzip", "-o", str(filepath)], cwd=workdir)
+        except Exception as e:
+            LOG.error(f"Erro no build de {name}: {e}")
+            return False
 
+        finally:
+            try:
+                sb.destroy(clean=not self.cfg.get("sandbox", {}).get("keep", False))
+            except Exception as e:
+                LOG.warning(f"Erro destruindo sandbox para {name}: {e}")
 
-def apply_patches(patch_dir: Path, target_dir: Path):
-    if not patch_dir.exists():
-        return
-    for patch in sorted(patch_dir.glob("*.patch")):
-        log(f"aplicando patch {patch.name}")
-        run_cmd(["patch", "-p1", "-i", str(patch)], cwd=target_dir)
+    def remove(self, portname: str, force: bool = False, dry_run: bool = False, yes: bool = False) -> bool:
+        LOG.info(f"Remover iniciado: {portname}, force={force}, dry_run={dry_run}, yes={yes}")
+        try:
+            res = remove_package(portname, force=force, dry_run=dry_run, yes=yes)
+            if res.get("status") == "ok":
+                # remover hook
+                LOG.info(f"{portname} removido com sucesso")
+                return True
+            else:
+                LOG.error(f"Remoção falhou: {res.get('message')}")
+                return False
+        except Exception as e:
+            LOG.error(f"Erro em remove de {portname}: {e}")
+            return False
 
+    def sync(self) -> bool:
+        LOG.info("Sincronização iniciada")
+        repo = self.cfg.get("repo", {})
+        url = repo.get("url")
+        branch = repo.get("branch", "main")
+        if not url:
+            LOG.error("repo.url não configurado")
+            return False
+        ports = self.ports_root
+        try:
+            if (ports / ".git").exists():
+                subprocess.run(["git", "-C", str(ports), "fetch", "--all"], check=True)
+                subprocess.run(["git", "-C", str(ports), "checkout", branch], check=True)
+                subprocess.run(["git", "-C", str(ports), "pull", "origin", branch], check=True)
+                LOG.info("Sync via git concluído")
+                return True
+            else:
+                LOG.error("Diretório de ports não é repositório git")
+                return False
+        except Exception as e:
+            LOG.error(f"Erro sincronizando ports: {e}")
+            return False
 
-def run_hooks(hooks: Dict[str, str], stage: str, sandbox_dir: Path):
-    if stage in hooks and hooks[stage]:
-        log(f"executando hook {stage}")
-        run_in_sandbox(sandbox_dir, hooks[stage])
+    def info(self, portname: str) -> None:
+        pf = self.ports_root / portname / "Portfile.yaml"
+        if not pf.exists():
+            LOG.error(f"Portfile não encontrado para {portname}")
+            return
+        try:
+            meta = yaml.safe_load(pf.read_text(encoding="utf-8"))
+        except Exception as e:
+            LOG.error(f"Erro lendo Portfile {portname}: {e}")
+            return
+        name = meta.get("name", portname)
+        version = meta.get("version", "unknown")
+        deps = meta.get("depends", [])
+        installed = self.load_installed()
+        status = "installed" if name in installed else "not installed"
+        LOG.info(f"Port: {name}")
+        LOG.info(f" Version: {version}")
+        LOG.info(f" Dependências: {deps}")
+        LOG.info(f" Status: {status}")
+        if status == "installed":
+            LOG.info(f" Instalado versão: {installed[name].get('version')}")
+        # show update info if present
+        if "update" in meta:
+            LOG.info(f" Pode atualizar via: {meta['update']}")
 
+    def list_ports(self) -> None:
+        if not self.ports_root.exists():
+            LOG.error(f"Pasta de ports não encontrada: {self.ports_root}")
+            return
+        for d in sorted(self.ports_root.iterdir()):
+            if d.is_dir():
+                pf = d / "Portfile.yaml"
+                if pf.exists():
+                    try:
+                        meta = yaml.safe_load(pf.read_text(encoding="utf-8"))
+                        name = meta.get("name", d.name)
+                        version = meta.get("version", "unknown")
+                        print(f"{name} - {version}")
+                    except Exception as e:
+                        print(f"{d.name} - erro ao ler versão: {e}")
 
-def build_with_system(build_type: str, sandbox_dir: Path):
-    if build_type == "autotools":
-        cmds = [
-            "./configure --prefix=/usr",
-            "make -j$(nproc)",
-            "make install DESTDIR=/install"
-        ]
-    elif build_type == "python":
-        cmds = [
-            "python3 setup.py build",
-            "python3 setup.py install --root=/install --prefix=/usr"
-        ]
-    elif build_type == "rust":
-        cmds = [
-            "cargo build --release",
-            "cargo install --path . --root /install/usr"
-        ]
-    elif build_type == "java":
-        cmds = [
-            "javac *.java",
-            "mkdir -p /install/usr/share/java",
-            "cp *.class /install/usr/share/java/"
-        ]
-    else:
-        log(f"tipo de build desconhecido: {build_type}")
-        return False
+    # CLI exposta
+    @staticmethod
+    def cli():
+        import argparse
+        parser = argparse.ArgumentParser(prog="pyport", description="PyPort core CLI")
+        sub = parser.add_subparsers(dest="cmd", required=True)
 
-    for cmd in cmds:
-        run_in_sandbox(sandbox_dir, cmd)
-    return True
+        p_build = sub.add_parser("build", help="Construir port")
+        p_build.add_argument("portname")
+        p_build.add_argument("--force", action="store_true")
+        p_build.add_argument("--dry-run", action="store_true")
 
+        p_remove = sub.add_parser("remove", help="Remover port instalado")
+        p_remove.add_argument("portname")
+        p_remove.add_argument("--force", action="store_true")
+        p_remove.add_argument("--dry-run", action="store_true")
+        p_remove.add_argument("--yes", action="store_true")
 
-def build_port(portname: str):
-    portfile = PORTFILES_ROOT / f"{portname}/Portfile.yaml"
-    if not portfile.exists():
-        log(f"Portfile {portfile} não encontrado")
-        return False
+        p_sync = sub.add_parser("sync", help="Sincronizar ports tree")
 
-    meta = load_portfile(portfile)
-    name, version = meta["name"], meta["version"]
+        p_info = sub.add_parser("info", help="Mostrar info de port")
+        p_info.add_argument("portname")
 
-    log(f"iniciando build de {name}-{version}", name)
+        p_list = sub.add_parser("list", help="Listar ports disponíveis")
 
-    resolve_dependencies(meta.get("depends", []))
+        args = parser.parse_args()
 
-    sandbox_dir = create_sandbox(name, version)
-    workdir = sandbox_dir / "build"
-    workdir.mkdir(parents=True, exist_ok=True)
+        core = Core()
 
-    download_sources(meta.get("source", []), workdir)
+        if args.cmd == "build":
+            ret = core.build(args.portname, force=args.force, dry_run=args.dry_run)
+            sys.exit(0 if ret else 1)
+        elif args.cmd == "remove":
+            ret = core.remove(args.portname, force=args.force, dry_run=args.dry_run, yes=args.yes)
+            sys.exit(0 if ret else 1)
+        elif args.cmd == "sync":
+            ret = core.sync()
+            sys.exit(0 if ret else 1)
+        elif args.cmd == "info":
+            core.info(args.portname)
+        elif args.cmd == "list":
+            core.list_ports()
+        else:
+            parser.print_help()
 
-    patch_dir = portfile.parent / PATCHES_DIRNAME
-    apply_patches(patch_dir, workdir)
-
-    run_hooks(meta.get("hooks", {}), "pre_configure", sandbox_dir)
-
-    if meta.get("build", "custom") != "custom":
-        build_with_system(meta["build"], sandbox_dir)
-    else:
-        run_hooks(meta.get("hooks", {}), "build", sandbox_dir)
-
-    run_hooks(meta.get("hooks", {}), "post_configure", sandbox_dir)
-    run_hooks(meta.get("hooks", {}), "pre_install", sandbox_dir)
-    run_hooks(meta.get("hooks", {}), "install", sandbox_dir)
-    run_hooks(meta.get("hooks", {}), "post_install", sandbox_dir)
-
-    metadata_path = sandbox_dir / "metadata.json"
-    metadata = {
-        "name": name,
-        "version": version,
-        "depends": meta.get("depends", []),
-        "description": meta.get("description", ""),
-        "sandbox": str(sandbox_dir / "install")
-    }
-    metadata_path.write_text(json.dumps(metadata, indent=2))
-
-    results = package_from_metadata(metadata_path)
-
-    log(f"build concluído: {results}", name)
-    return True
-
-
-def install_port(portname: str):
-    db = load_installed_db()
-    if portname in db:
-        log(f"{portname} já instalado")
-        return False
-
-    pkgdir = Path("/pyport/packages")
-    pkgfile = next(pkgdir.glob(f"{portname}-*.tar.zst"), None)
-    if not pkgfile:
-        log(f"pacote {portname} não encontrado, execute build primeiro")
-        return False
-
-    log(f"instalando {pkgfile}", portname)
-    subprocess.run(f"tar --use-compress-program=zstd -xvf {pkgfile} -C /", shell=True, check=True)
-
-    db[portname] = {"pkgfile": str(pkgfile)}
-    save_installed_db(db)
-    return True
-
-
-def remove_port(portname: str):
-    db = load_installed_db()
-    if portname not in db:
-        log(f"{portname} não está instalado")
-        return False
-
-    log(f"removendo {portname}", portname)
-    # futuro: remover rastreamento de arquivos
-    del db[portname]
-    save_installed_db(db)
-    return True
-
+def main():
+    Core.cli()
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Uso: python3 core.py <build|install|remove> <nome>")
-        sys.exit(1)
-
-    cmd, pkg = sys.argv[1], sys.argv[2]
-    if cmd == "build":
-        build_port(pkg)
-    elif cmd == "install":
-        install_port(pkg)
-    elif cmd == "remove":
-        remove_port(pkg)
-    else:
-        print(f"comando desconhecido: {cmd}")
+    main()
