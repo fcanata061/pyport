@@ -1,0 +1,215 @@
+PyPort - Gerenciador de Ports estilo BSD em Python
+==================================================
+
+PyPort é um sistema de gerenciamento de pacotes baseado em ports, escrito em Python,
+com suporte a construção automatizada em sandbox, integração com fakeroot, chroot,
+toolchain e systemd.
+
+Ele permite instalar, remover, buscar, atualizar e compilar programas diretamente do código-fonte,
+com suporte a múltiplos downloads, patches e dependências.
+
+--------------------------------------------------
+1. Estrutura de diretórios
+--------------------------------------------------
+
+Após instalado (via `make install`), a estrutura padrão é:
+
+/usr/bin/pyport          -> binário principal (CLI)
+/usr/lib/pyport/         -> módulos internos
+    build.py
+    cli.py
+    config.py
+    core.py
+    dependency.py
+    fakeroot.py
+    info.py
+    install.py
+    logger.py
+    packager.py
+    remove.py
+    sandbox.py
+    search.py
+    sync.py
+    toolchain.py
+    update.py
+
+/usr/ports/              -> repositório de portfiles
+    categoria/
+        programa/
+            portfile.yaml
+            patches/
+                001-fix-bug.patch
+                002-extra-feature.patch
+
+--------------------------------------------------
+2. Portfile
+--------------------------------------------------
+
+Cada programa é descrito por um `portfile.yaml`, por exemplo:
+
+name: gcc
+version: 13.2.0
+category: lang
+source:
+  - url: https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz
+  - url: https://gcc.gnu.org/git/gcc.git
+build:
+  system: autotools
+  configure_flags: ["--disable-multilib", "--enable-languages=c,c++"]
+dependencies:
+  - gmp
+  - mpfr
+  - mpc
+patches:
+  - patches/001-fix-bug.patch
+  - patches/002-extra-feature.patch
+hooks:
+  pre-configure: ["echo 'Preparando build do GCC'"]
+  post-install: ["echo 'GCC instalado com sucesso'"]
+update:
+  check_url: https://gcc.gnu.org/releases.html
+  regex: "gcc-(\\d+\\.\\d+\\.\\d+)"
+
+--------------------------------------------------
+3. Comandos principais
+--------------------------------------------------
+
+Todos os comandos são acessados via `pyport <comando> [opções]`.
+
+Atalhos (abreviações) são suportados:  
+- `i` → install  
+- `r` → remove  
+- `b` → build  
+- `s` → search  
+- `u` → update  
+- `t` → toolchain  
+- `c` → chroot  
+
+Exemplos:
+  pyport install vim
+  pyport i gcc
+  pyport remove nano
+  pyport r python
+  pyport build firefox
+  pyport b zsh
+  pyport search editor
+  pyport s gcc
+  pyport info vim
+  pyport sync
+  pyport update
+  pyport toolchain create
+  pyport t list
+  pyport chroot enter
+
+--------------------------------------------------
+4. Gerenciamento de dependências
+--------------------------------------------------
+
+- PyPort resolve dependências automaticamente em ordem topológica.
+- Suporta:
+  * dependências diretas
+  * dependências recursivas
+  * dependências reversas (quem depende de quem)
+- Caso um pacote dependa de outro, o PyPort constrói primeiro os requisitos.
+
+Exemplo:
+  pyport install gcc
+  -> instala gmp → mpfr → mpc → gcc
+
+--------------------------------------------------
+5. Sandbox e fakeroot
+--------------------------------------------------
+
+- Toda construção ocorre em um diretório sandbox isolado:
+  /tmp/pyport-build/<pacote>
+
+- A instalação é feita com `fakeroot`, garantindo que os arquivos recebam
+  permissões corretas sem exigir root.
+
+- Logs de build ficam em:
+  /var/log/pyport/<pacote>.log
+
+--------------------------------------------------
+6. Chroot e Toolchain
+--------------------------------------------------
+
+- PyPort suporta criação de toolchains em `/mnt/tools`.
+- É possível criar ambientes chroot prontos para continuar a construção:
+
+Comandos:
+  pyport toolchain create
+  pyport toolchain remove
+  pyport toolchain list
+
+  pyport chroot enter
+  pyport chroot clean
+
+--------------------------------------------------
+7. Patches
+--------------------------------------------------
+
+- Portfiles podem ter múltiplos patches aplicados em ordem:
+  patches/001.patch
+  patches/002.patch
+
+- Eles são aplicados automaticamente no processo de build.
+
+--------------------------------------------------
+8. Atualizações
+--------------------------------------------------
+
+- PyPort verifica versões novas automaticamente (via `update`).
+- Busca em HTTP, FTP ou Git.
+- Notifica via `notify-send`.
+- Gera relatório em `/var/log/pyport/updates.log`.
+
+Comando:
+  pyport update
+
+--------------------------------------------------
+9. Exemplos práticos
+--------------------------------------------------
+
+Instalar um programa:
+  pyport install vim
+
+Remover um programa:
+  pyport remove vim
+
+Buscar programas:
+  pyport search compiler
+
+Obter informações detalhadas:
+  pyport info vim
+
+Sincronizar repositório:
+  pyport sync
+
+Construir pacote manualmente:
+  pyport build gcc
+
+Verificar atualizações:
+  pyport update
+
+Criar toolchain:
+  pyport toolchain create
+
+Entrar no chroot:
+  pyport chroot enter
+
+--------------------------------------------------
+10. Logs e Configuração
+--------------------------------------------------
+
+Configuração em `/etc/pyport/config.yaml` (ou similar):
+
+Exemplo:
+log_dir: /var/log/pyport
+ports_dir: /usr/ports
+build_dir: /tmp/pyport-build
+sandbox: true
+fakeroot: true
+notify: true
+
+Logs ficam em:
+  /var/log/pyport/
